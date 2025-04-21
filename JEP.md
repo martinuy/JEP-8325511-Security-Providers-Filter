@@ -1,68 +1,39 @@
 Summary
 -------
 
-Extend the Java Cryptographic Architecture (JCA) with a filtering mechanism to configure which services, implemented by installed security providers, are enabled in run time.
+Extend the Java Cryptographic Architecture (JCA) with a runtime filtering mechanism to enable or disable security provider services.
 
 
 Goals
 -----
 
-The main goal of this proposal is to implement a filtering mechanism to constrain which services, implemented by installed security providers, are available for use in the `getInstance` JCA APIs (Cipher, Signature, Mac, KeyFactory, etc). A service that is not enabled by the filter should not be eligible for use as if its security provider did not implement it.
+- Implement a filtering mechanism to constrain which security providers’ services are available for use in the `getInstance` JCA APIs.
 
-The filtering mechanism should apply to services implemented either by statically installed security providers (i.e. defined by `security.provider.<n>` Security properties) or dynamically installed ones (i.e. added with the `java.security.Security::addProvider` API). No distinctions should be made between OpenJDK and third-party security providers.
-
-The services filter has to be configurable by means of a Security property, overridable with a System property of the same name. As for the syntax of this property, the following characteristics are desired: 1) support service identification per provider name, service type and algorithm name or alias; 2) include constructs to select multiple services by a single rule (e.g. all services of a certain service type); 3) support expressing rule actions in an allow or deny-like manner; and 4) be concise, simple and unambiguous. Given the security sensitive nature of this feature, any syntactic error in the filter value should be fatal. In order to facilitate troubleshooting, error and diagnostic logging should be implemented.
+- Apply the filter uniformly to both statically and dynamically installed OpenJDK and third-party providers.
 
 
 Non-Goals
 ---------
 
-When a service is not allowed by a filter, dependent application or library functionality will stop working. Further affected functionality could be a service that uses a disabled service as a building block. It is not a goal of this proposal to implement a mechanism to warn about dependent functionality potentially affected by a given filter value. In addition, a filter value entered by a user may include redundant or superfluous rules. These rules will not be detected or cleaned up automatically. Users of this feature are expected to perform an assessment to understand and validate the implications of disabling a service, and at the same time ensure internal consistency for the filter value set.
+- It is not a goal to standardize service names across OpenJDK and third-party providers.  The names used by the filter are based on the providers installed.
 
-This proposal does not aim to standardize algorithm names across OpenJDK and third-party security providers. When defining a filter value, services implemented by installed security providers and their algorithm names or aliases must be known. It is important to consider that security providers may use slightly different names for the same algorithm, or may not define the same aliases.
-
-It is not a goal to implement filtering capabilities based on service clients (i.e. allowing or denying a service depending on which class, package or module is trying to use it). In addition, identifying services with a granularity finer than an algorithm name or alias (e.g. based on key size or other algorithm parameters) is not under the scope at this time. With that said, extensions to this proposal may be explored in the future and characters such as `:` and `,` will be reserved in the filter syntax for this purpose.
-
-It is out of the scope to implement an API that supports the definition of filter values dynamically with Java code, in the same way that `java.io.ObjectOutputStream::setObjectInputFilter` does for serialization filters. Furthermore, filters should be immutable. It is not a goal to implement a mechanism to reinitialize or modify a filter value in run time.
-
-The filter is not a framework to assist security providers to achieve their FIPS certification requirements. A security provider must only register the algorithms for which it has been certified, with the appropriate parameters, and should not delegate or externalize this decision to the filter.
-
-Success Metrics
----------------
-
-Whereas all listed goals of this feature are either binary or qualitative, it is still relevant to define numerically quantifiable metrics to ensure that no performance regressions in the JCA APIs are introduced. Meeting the following performance metrics is required for success:
-
-1. An empty filter must not cause any performance regression. This type of filter, configured in OpenJDK by default, would not block any service.
-
-2. A non-empty filter may cause a negligible performance penalty both during JCA initialization and provider registration, but must not cause any impact at service use time. The penalty expected during JCA initialization is due to filter parsing and should be of order _O(n)_, with _n_ being the number of characters in the filter value. At provider registration time, a performance penalty is expected due to the evaluation of services against the filter. This evaluation shall occur only once per service.
+- It is not a goal to filter based on the calling class, package, module, or any algorithm parameters, such as key size, or `AlgorithmParameterSpec`.
 
 
 Motivation
 ----------
 
-Current configuration capabilities in the JCA allow users to install security providers statically or dynamically, decide their preference in an ordered list and even circumvent this order for specific services. However, there is no granularity in terms of which services installed security providers bring with them: it is an _all_ or _none_ decision. Historically, security providers lump together services of various types. As an example, the SUN security provider comes with services of the following types: SecureRandom, Signature, KeyPairGenerator, AlgorithmParameterGenerator, AlgorithmParameters, KeyFactory, MessageDigest, CertificateFactory, KeyStore, CertStore, Policy, Configuration, CertPathBuilder and CertPathValidator. This lack of flexibility in provider configuration negatively affects scenarios where policy compliance is required.
+Security providers drive the JCA, offering a wide range of cryptographic services. These services are utilized by the Security APIs (Cipher, Signature, etc.) to facilitate various operations. Regardless of the service's security quality, any application can utilize them. However, the current JCA design lacks an option to limit these services, which may be necessary depending on deployments.
+
+Current configuration capabilities in the JCA allow users to install security providers statically or dynamically, decide their preference in an ordered list and even circumvent this order for specific services. If an algorithm is not found in a preferred provider, it will be looked up in a less preferred one. However, there is no granularity in terms of which services installed security providers bring with them: it is an _all_ or _none_ decision. Historically, security providers lump together services of various types. As an example, the SUN security provider comes with services of types SecureRandom, Signature, KeyPairGenerator and many others. This lack of flexibility in provider configuration negatively affects scenarios where policy compliance is required.
 
 ### FIPS 140 compliance
 
-For FIPS 140 compliance, cryptographic operations shall be done within a FIPS-certified module. In OpenJDK, the SunPKCS11 security provider can be configured with a FIPS-certified hardware or software module, such as the NSS Software Token. Other third-party security providers like Bouncy Castle may also be FIPS-certified.
-
-Security providers bundled in OpenJDK (SUN, SunJCE, SunEC, etc.) are not FIPS-certified but may be still needed for X.509 certificates support, TLS or other non-cryptographic functionality. The problem is that they bring with them non-FIPS cryptography that, if inadvertently used, would compromise the overall compliance.
-
-Ordering installed security providers in descending preference is not enough to resolve this issue because of the fallback scheme: if an algorithm is not found in a preferred provider, it will be looked up in a less preferred one. The FIPS 140 compliance use case would benefit if policy enforcement at the security provider level ensures that non-compliant cryptographic services are disabled.
+Security providers bundled in OpenJDK (SUN, SunJCE, SunEC, etc.) are not FIPS-certified but some of their services may still be needed for X.509 certificates support, TLS or other non-cryptographic functionality. A filter would prevent the inadvertent use of non FIPS-certified cryptography from installed security providers.
 
 ### Cryptographic policies
 
-Cryptographic algorithms could weaken or become unsuitable for use over time, compromising information security and regulations compliance. For this reason, most organizations periodically review and enforce policies that establish which cryptographic algorithms are allowed for use.
-
-While OpenJDK has Security properties to limit cryptographic algorithms for TLS, certificate path validation and JAR signing, these restrictions do not apply to JCA APIs (Cipher, Signature, Mac, etc). Thus, an installed security provider could bring a service implementing an algorithm that violates a defined policy and make it available for an application to use.
-
-The proposed filtering mechanism supports enforcement of cryptographic policies across all JCA APIs by defining the algorithms that should be either blocked or allowed. In any case, a cryptographic policy can be enforced and updated easily at system administrator's discretion.
-
-In particular, mainstream Linux distributions can further extend the reach of _crypto-policies_ alignment and enforce these policies over all OpenJDK JCA APIs. _Crypto-policies_ is a package that contains curated lists of cryptographic algorithms according to security profiles that can be set globally in the operating system. Security profiles provide different levels of security hardening that lean more towards backward compatibility, complying with regulations such as FIPS, establishing a secure default or anticipating future requirements. Each of these profiles would have a filter value according to the algorithms that should be allowed or blocked.
-
-### Checkpoint/Restore In Userspace (CRIU) safety assessment
-
-For CRIU use cases, a snapshot of the JVM process is taken once and resumed multiple times. The reuse of cryptographic pseudo-random numbers, secrets or keys may weaken or compromise the security of the system. The proposed filtering mechanism would be beneficial to enforce a cryptographic policy that disables random value generators and key generators and then assessing if there were any issues while taking a snapshot. If there were not, it is reasonable to assume that the application is safe for CRIU use.
+While OpenJDK has Security properties to limit cryptographic algorithms for TLS, certificate path validation and JAR signing, these restrictions do not apply to JCA APIs (Cipher, Signature, Mac, etc). Thus, an installed security provider could bring a service implementing an algorithm that violates a defined policy and make it available for an application to use. The proposed filtering mechanism supports enforcement of cryptographic policies across all JCA APIs by defining the algorithms that should be either blocked or allowed. In any case, a cryptographic policy can be enforced and updated easily at system administrator's discretion.
 
 ### Interoperability, performance and other policies
 
@@ -70,13 +41,7 @@ For interoperability, the use of standard algorithms may need to be enforced. As
 
 Performance is also a possible reason for the enforcement of a policy. If a security provider is significantly faster than others, a policy may require that all operations of a specific type should be done with it. If an algorithm is not supported by the fastest provider, the filtering mechanism proposed would prevent a silent fallback to a slower implementation.
 
-More generally, an organization can control which security providers, service types and algorithms are used according to a defined policy or criteria. This proposal does not constrain policies to fixed cases but gives flexibility for customization to specific needs.
-
-In summary, all the previous use cases may benefit from this proposal in terms of security, compliance, performance and interoperability. What is common to these cases is the enforcement of a defined policy across all JCA components for every application running on a specific JDK deployment. The filter mechanism is envisioned as a flexible and powerful tool for system administrators and packagers alike. As such, it requires an intermediate level of understanding of the JCA, the installed security providers and its own documentation.
-
-The enforcement of a policy may have two possible and intended outcomes for an application: 1) automatic compliance with the policy —e.g. switch to an algorithm that is allowed—, or 2) error throwing for manual corrective action to be taken —e.g. a `java.security.NoSuchAlgorithmException` exception—. In any case, the risk of an inadvertent policy breaching should be mitigated.
-
-Achieving the same level of policy enforcement without the proposed filtering mechanism would be more difficult, error-prone and even not feasible in some cases. It would require an open-box approach to audit source code, configurations and generated logs for every application running on a JDK deployment to detect uses of the JCA that are not compliant. The automatic policy adaptation advantage, previously described as outcome \#1, would not be available.
+Current mechanisms in OpenJDK are not flexible and comprehensive enough to restrict the usage of weak cryptographic algorithms, which detriments OpenJDK's policy and regulatory compliance. By introducing a filtering mechanism to control which providers, service types and algorithms are allowed across all JCA APIs, system administrators and packagers have an enhanced capacity to align OpenJDK deployments to defined policies. In addition to security and compliance, this new mechanism enables performance and interoperability policies to be enforced.
 
 
 Description
