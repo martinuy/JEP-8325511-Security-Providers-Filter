@@ -23,131 +23,49 @@ Non-Goals
 Motivation
 ----------
 
-Security providers drive the JCA, offering a wide range of cryptographic services. These services are utilized by the Security APIs (Cipher, Signature, etc.) to facilitate various operations. Regardless of the service's security quality, any application can utilize them. However, the current JCA design lacks an option to limit these services, which may be necessary depending on deployments.
+Security providers offer a wide range of cryptographic services that can be accessed through JCA APIs such as Cipher and Signature. Given an algorithm, a service is selected based on a list of providers ordered by preference —potentially altered by the `jdk.security.provider.preferred` security property—, or by specifying the provider in the API invocation.
 
-Current configuration capabilities in the JCA allow users to install security providers statically or dynamically, decide their preference in an ordered list and even circumvent this order for specific services. If an algorithm is not found in a preferred provider, it will be looked up in a less preferred one. However, there is no granularity in terms of which services installed security providers bring with them: it is an _all_ or _none_ decision. Historically, security providers lump together services of various types. As an example, the SUN security provider comes with services of types SecureRandom, Signature, KeyPairGenerator and many others. This lack of flexibility in provider configuration negatively affects scenarios where policy compliance is required.
+All services implemented by a provider are available to applications, regardless of whether their algorithm is cryptographically weak or non-compliant with a defined policy. The current mechanism misses the ability to block services by algorithm, service type or provider. While security properties exist to limit cryptographic algorithms in certain contexts —such as TLS, certificate path validation, and JAR signing—, these restrictions are only enforced at the implementation level and do not extend to every JCA API. Removing entire providers is not a viable solution, as services to be excluded might be bundled together with services required by an application. Selecting a provider for each API invocation might be possible in some cases but requires widespread code changes to the application and its dependencies, lacks flexibility, adds to the maintenance burden, and is less reliable due to the risk of overlooking a call site.
 
-### FIPS 140 compliance
-
-Security providers bundled in OpenJDK (SUN, SunJCE, SunEC, etc.) are not FIPS-certified but some of their services may still be needed for X.509 certificates support, TLS or other non-cryptographic functionality. A filter would prevent the inadvertent use of non FIPS-certified cryptography from installed security providers.
-
-### Cryptographic policies
-
-While OpenJDK has Security properties to limit cryptographic algorithms for TLS, certificate path validation and JAR signing, these restrictions do not apply to JCA APIs (Cipher, Signature, Mac, etc). Thus, an installed security provider could bring a service implementing an algorithm that violates a defined policy and make it available for an application to use. The proposed filtering mechanism supports enforcement of cryptographic policies across all JCA APIs by defining the algorithms that should be either blocked or allowed. In any case, a cryptographic policy can be enforced and updated easily at system administrator's discretion.
-
-### Interoperability, performance and other policies
-
-For interoperability, the use of standard algorithms may need to be enforced. As an example, storing keys and certificates in a PKCS \#12 format could be necessary for interoperability with other systems. The proposed filtering mechanism can be used to enforce this type of policy.
-
-Performance is also a possible reason for the enforcement of a policy. If a security provider is significantly faster than others, a policy may require that all operations of a specific type should be done with it. If an algorithm is not supported by the fastest provider, the filtering mechanism proposed would prevent a silent fallback to a slower implementation.
-
-Current mechanisms in OpenJDK are not flexible and comprehensive enough to restrict the usage of weak cryptographic algorithms, which detriments OpenJDK's policy and regulatory compliance. By introducing a filtering mechanism to control which providers, service types and algorithms are allowed across all JCA APIs, system administrators and packagers have an enhanced capacity to align OpenJDK deployments to defined policies. In addition to security and compliance, this new mechanism enables performance and interoperability policies to be enforced.
+A filtering mechanism that blocks services across all JCA APIs would enable system administrators and application packagers to apply JDK-wide security and compliance policies. The list of policies that may be enforced includes security standards such as FIPS 140, performance policies to prevent the use of slow algorithms and policies to select algorithms based on interoperability.
 
 
 Description
 -----------
 
-This proposal is for a configurable filter to enable or disable services implemented by installed security providers. The filter is initialized along with the security providers classes, using either the value of the `jdk.security.providers.filter` Security property or a System property of the same name. If the System property is passed, it supersedes the Security one. Both properties are updateable at runtime which leaves a window for runtime code to side-effect the configuration prior to filter initialization. However, once the filter has been initialized subsequent runtime property updates will not cause the filter to be reset. When a filter is not set or is set to the empty string, filtering is disabled: all services are allowed.
+This proposal is for a configurable filter to enable or disable services implemented by security providers. The filter is initialized along with the providers classes, using the value of the `jdk.security.providers.filter` overridable security property. Once the filter is initialized, subsequent run time property updates do not cause a filter reset. When the filter property is not set or is set to the empty string, filtering is disabled. Each service is evaluated by the filter once in its lifetime, before use. A service that is rejected by the filter cannot be used in any of the JCA APIs, as if it were not implemented by its provider.
 
-The filter applies to services implemented by both OpenJDK and third-party providers, either statically with a `security.provider.<n>` Security property or dynamically with the `java.security.Security::addProvider` API. Filtering is enforced according to a multi-layer strategy, capable of blocking services at different levels. This strategy is designed to cover common and special cases with maximum efficacy. For most providers —including OpenJDK's—, services are filtered in `java.security.Provider::put` or `java.security.Provider::putService` methods, and never returned in `java.security.Provider::getService` or `java.security.Provider::getServices`. For third-party providers that override `java.security.Provider::getService` or `java.security.Provider::getServices` to return services that have not been evaluated against the filter or are evaluated and not allowed, a second filter enforcement occurs in `java.security.Provider.Service::newInstance`. In rare situations, a third-party provider can override `java.security.Provider.Service::newInstance` and return an unvetted service implementation (SPI). As a last layer of defense, services are checked in `::getInstance` APIs. For the last defense to be effective, the service type must be one of the available in the JDK (Cipher, Signature, Mac, etc.). Third-party service types cannot take advantage of this check as the filter does not expose a public API.
+Filtering is enforced according to a multi-layer blocking strategy. Services are first filtered in `java.security.Provider` methods during registration. A second filter enforcement occurs in `java.security.Provider.Service::newInstance` to block unregistered services returned by special providers. In rare situations, a provider can override `::newInstance` and return an unvetted service implementation (SPI). Thus, a last layer of filtering is enforced in `::getInstance` JCA APIs.
 
-Each service is evaluated by the filter only once in its lifetime, before use. A service that is rejected by the filter cannot be used in any of the JCA APIs, as if it were not implemented by its security provider. Depending on services availability, attempting to use a service blocked may result in a `java.security.NoSuchAlgorithmException` exception or the return of a different implementation for the same algorithm, according to the preference order of installed security providers.
-
-OpenJDK has Security properties for disabling algorithms in the TLS, JAR signing and certificate path validation subsystems (`jdk.tls.disabledAlgorithms`, `jdk.jar.disabledAlgorithms` and `jdk.certpath.disabledAlgorithms` respectively). This existing mechanism applies on top of the proposed filter. Thus, for an algorithm to be available, it has to be allowed by both the existing mechanism and the proposed filter.
-
-Services are identifiable as a combination of a security provider, a service type and an algorithm name. Optionally, an algorithm alias can be used to replace the algorithm name. A filter is made of a sequence of patterns that identify a service according to a matching criteria —as we shall see later— and indicate an action: allow or deny the service under evaluation.
+Services are identifiable as a combination of a provider, a service type and an algorithm name. Optionally, an algorithm alias can be used in place of an algorithm name. A filter is made of a sequence of patterns that identify a service according to a matching criteria and indicate an action: allow or deny the service under evaluation.
 
 The filter syntax is as follows:
 
 `pattern-1; pattern-2; ...; pattern-n`
 
-Each pattern in the sequence can be optionally prefixed by a `'!'` character (e.g. `! pattern-1`). White spaces between patterns, pattern prefixes (`'!'`) and pattern separators (`';'`) are not significant. A service is evaluated against the filter from left to right. If a service matches one of the patterns in the sequence, an authorization decision is made: if the pattern is prefixed by a `'!'` character, the decision is to deny it; otherwise, the decision is to allow it. If none of the patterns match, the default decision is to deny the service. Once a decision is made, remaining patterns are not considered.
+A service is evaluated against the filter from left to right. If a service matches one of the patterns in the sequence, a final authorization decision is made: if the pattern is prefixed by a `'!'` character (e.g. `! pattern-1`), the decision is to deny it; otherwise, the decision is to allow it. If none of the patterns match, the default decision is to deny the service. White spaces between patterns, pattern prefixes (`'!'`) and pattern separators (`';'`) are not significant.
 
 Each pattern's syntax has one of the following forms:
 
-1\. `security-provider`
+1\. `provider`
 
-2\. `security-provider.service-type`
+2\. `provider.service-type`
 
-3\.a\. `security-provider.service-type.algorithm-name`
+3\. `provider.service-type.algorithm-or-alias`
 
-3\.b\. `security-provider.service-type.algorithm-alias`
+In form \#1, a provider name equal to _provider_ is enough for a match to be successful. In form \#2, the service type must also be equal to _service-type_. In form \#3, the service algorithm or any of its aliases must also be equal to _algorithm-or-alias_. Cipher services require special handling as they might register multiple transformations under a single algorithm name, by means of the `SupportedModes` and `SupportedPaddings` attributes. When `Cipher.getInstance(transformation)` finds a service, a filter match is successful if _transformation_ or any of its aliases is equal to _algorithm-or-alias_ in form \#3.
 
-3\.c\. `security-provider.Cipher.transformation`
+Characters `'\n'` and `'\0'` are not valid in a pattern. The character `'.'` is used as a separator between different levels: provider, service type, algorithm name or alias. The following characters, when part of one of the listed levels, must be escaped by prepending a `'\'` character: `'!'`, `'*'`, `' '` (white space), `'.'`, `';'`, `'\'`, `':'` and `','`. Escaping any other character has no effect other than silently discarding the `'\'` character. Additionally, pattern names can contain `'*'` wildcards to imply zero or more repetitions of any character. Wildcards behave in greedy mode, trying to consume as many characters as possible and backing off if necessary.
 
-3\.d\. `security-provider.Cipher.transformation-alias`
+The implementation of a service itself may require another service as a building block, either by invoking a JCA API or creating an instance of its implementation class directly. As a result, blocking a building block service may exhibit different behavior between providers. For example, blocking the service MessageDigest SHA256 may cause the service Signature SHA256withECDSA to stop working on a provider that obtained it through the JCA but does not affect one that creates an instance of its implementation class. If the service Signature SHA256withECDSA has to be blocked, the filter must have a rule for it.
 
-In form \#1, a security provider name equal to _security-provider_ is enough for a match to be successful. In form \#2, the service type must also be equal to _service-type_. In form \#3.a, the service algorithm must also be equal to _algorithm-name_. In form \#3.b, it is enough that one of the service aliases matches _algorithm-alias_, in addition to the requirements for form \#2. Form \#3.c is similar to form \#3.a but applies to cipher transformations with multiple components (`algorithm/mode/padding`). Form \#3.d is equivalent to \#3.c but looks for a transformation alias match (`algorithm-alias/mode/padding`). In all cases, pattern and service names must have valid characters and cannot be empty. Pattern matching is always case insensitive.
-
-Characters `'\n'` and `'\0'` are not valid in a pattern. The character `'.'` is used as a separator between different levels: security provider, service type, algorithm name or algorithm alias. The following characters, when part of one of the listed levels, must be escaped by prepending a `'\'` character: `'!'`, `'*'`, `' '` (white space), `'.'`, `';'`, `'\'`, `':'` and `','`. Escaping any other character has no effect other than silently discarding the `'\'` character.
-
-It is worth mentioning that these escaping rules apply to the filter value as read in the `java.security.Security::getProperty` and `java.lang.System::getProperty` APIs: additional escaping might be needed depending on how the filter value is passed. For example, Security properties require `'\'` characters to be escaped. Thus, to match a provider whose name is _abc\\123_, a pattern must be escaped as _abc\\\\\\\\123_ if passed as a Security property.
-
-In addition to character escape sequences, pattern names can contain `'*'` wildcards to imply zero or more repetitions of any character. Wildcards behave in greedy mode, trying to consume as many characters as possible and backing off if necessary.
-
-When a service has aliases, its algorithm name and each of the aliases are independently evaluated against the filter. Notice that the security provider and service type for each of these evaluations are the same. From the set of authorization decisions obtained —which can potentially be contradictory—, the one made by the left-most pattern in the filter has the highest priority and is finally effective. This strategy would be equivalent to modifying the evaluation of a service against each pattern so that each alias is tried (besides the algorithm name) and stopping if a decision is made for one of them.
-
-For troubleshooting, it is possible to enable filter debugging logs with the System property `java.security.debug=jca` and look for messages prefixed by _ProvidersFilter_. To list services allowed and not allowed by a filter for each installed security provider, run java with the argument `-XshowSettings:security:providers`. When a filter value is syntactically invalid, the exception message thrown points to the exact location in the pattern that could not be parsed.
-
-### Consistency between security providers when blocking building block services
-
-It is assumed that applications and libraries get instances of services through the JCA APIs and not by creating instances of their implementation classes directly, which are often private. If the latter were to happen, the filter would be ineffective to block a service.
-
-The implementation of a service itself may require another service as a building block. For example, a Signature service for the algorithm SHA256withECDSA could use a MessageDigest service for the algorithm SHA256. However, a SHA256withECDSA service from a different provider may handle this dependency by creating an instance of the building block's implementation class directly, instead of going through the JCA.
-
-As a result, blocking a building block service may exhibit different behavior in dependent services between security providers. For example, blocking the service MessageDigest SHA256 may cause the service Signature SHA256withECDSA to stop working on a provider that obtained it through the JCA but does not affect one that creates an instance of its implementation class.
-
-To mitigate the risk of confusion, documentation and guidelines will be elaborated indicating how to write an effective filter regardless of the security provider. Going back to the previous example, a filter blocking the service MessageDigest SHA256 **shall not** be assumed to have any effect on the service Signature SHA256withECDSA: if the service Signature SHA256withECDSA has to be blocked, the filter must have a rule for it. On the other hand, blocking MessageDigest SHA256 **may** cause other functionality —even beyond Signature SHA256withECDSA— to stop working.
-
-### The JCA Cipher API and transformations
-
-The Cipher API has a behavior that sets it apart from other JCA APIs. Algorithm names, referred to as transformations, are of the form `algorithm` (single component) or `algorithm/mode/padding` (multi-component). In a multi-component form, one of mode and padding may be empty but not both. If both components are empty, the single component form is used instead (i.e. _algorithm//_ is handled as _algorithm_). Multiple components transformations require special attention as they could be a source of confusion when defining a filter.
-
-When looking for services to support a multi-component transformation, four possible derivatives are tested as service algorithm or alias: _algorithm/mode/padding_, _algorithm/mode_, _algorithm//padding_ and _algorithm_. For example, if the transformation in a `Cipher::getInstance` call is AES/CBC/PKCS5Padding, services with algorithm or aliases AES/CBC/PKCS5Padding, AES/CBC, AES//PKCS5Padding and AES are searched by means of the `Provider::getService` API. A service may support a transformation even if its algorithm name and aliases do not match the transformation exactly, as in the last three cases of the previous example. The Cipher API does further checks in these cases to determine if the service actually supports the transformation.
-
-To illustrate how the previous case may be confusing, let's assume that the transformation AES/CBC/PKCS5Padding has to be allowed and everything else blocked. A natural filter value would be `*.Cipher.AES/CBC/PKCS5Padding; !*`. One service candidate to support the transformation is SunJCE's AES Cipher. However, this service would not be allowed by the filter. To address this problem, special handling of cipher transformations has to be implemented. This handling applies only to cases in which the transformation has multiple components and is different from the service algorithm and aliases.
-
-A service candidate to support a transformation has to be evaluated against the filter based on the transformation, and not its algorithm or aliases. The provider and type of the candidate service are correct for the evaluation, though. Possible transformation aliases need to be analyzed as well. Transformation aliases are built by iterating the service algorithm and aliases, extracting their first component after a `'/'` split and appending the transformation mode and padding to them.
-
-For example, in a `Cipher::getInstance("AES/CBC/PKCS5Padding")` call, the Cipher service AES from SunJCE is a candidate to support the transformation. For filter evaluation, the following transformation and transformation aliases are considered:
-
-1. AES/CBC/PKCS5Padding
-2. OID.2.16.840.1.101.3.4.1/CBC/PKCS5Padding
-3. 2.16.840.1.101.3.4.1/CBC/PKCS5Padding
-
-\#1 is the transformation; equal to splitting the service algorithm by `'/'`, extracting its first component ("AES") and appending the transformation mode and padding. \#2 and \#3 are transformation aliases based on the service aliases; after splitting each alias by `'/'`, taking its first component and appending the transformation mode and padding. The service would be allowed by transformation \#1.
-
-Transformation \#1 and its \#2 and \#3 aliases are equivalent arguments for a `Cipher::getInstance("transformation")` call: the same SunJCE AES Cipher service is returned. The filter provides support for transformation aliases in a way that is consistent with regular (non-transformation) aliases.
+For troubleshooting, it is possible to enable filter debugging logs with the System property `java.security.debug=jca` and look for messages prefixed by _ProvidersFilter_. To list services allowed and not allowed by a filter for each installed provider, run java with the argument `-XshowSettings:security:providers`. When a filter value is syntactically invalid, the exception message thrown points to the exact location in the pattern that could not be parsed.
 
 ### Examples of correctly defined filter values
 
 Enable all security providers, service types and algorithms:
 
 `jdk.security.providers.filter=`
-
-or
-
-`jdk.security.providers.filter=*`
-
-or
-
-`jdk.security.providers.filter=*.*`
-
-or
-
-`jdk.security.providers.filter=*.*.*`
-
---
-
-Enable all services except for SUN's MessageDigest implementation of the MD5 algorithm:
-
-`jdk.security.providers.filter=!SUN.MessageDigest.MD5; *`
-
---
-
-Enable all services except for MessageDigest implementations of the MD5 algorithm, irrespective of the security provider:
-
-`jdk.security.providers.filter=!*.MessageDigest.MD5; *`
 
 --
 
@@ -169,57 +87,13 @@ Other providers may define different values for algorithm names, default modes a
 
 `jdk.security.providers.filter=!*.Cipher.AES*/ECB/*; !*.Cipher.AES*//*; *.Cipher.AES*/*/*; !*.Cipher.AES*; *`
 
---
-
-Enable all services except for SunJCE's Cipher implementation of the RC4 algorithm:
-
-`jdk.security.providers.filter=!SunJCE.Cipher.ARCFOUR; *`
-
-or
-
-`jdk.security.providers.filter=!SunJCE.Cipher.RC4; *`
-
-or
-
-`jdk.security.providers.filter=!SunJCE.Cipher.1\.2\.840\.113549\.3\.4; *`
-
-Notice in this example how either the algorithm name or any of the aliases can be used for the same purpose.
-
---
-
-Enable the SUN security provider only, with all its service types and algorithms. Services implemented by other security providers should be disabled.
-
-`jdk.security.providers.filter=SUN`
-
-or
-
-`jdk.security.providers.filter=SUN; !*`
-
-Notice how in the first value for this example the implicit rule of blocking anything that does not match a pattern takes effect.
-
---
-
-Enable the SUN security provider only, with all its service types and algorithms except for MessageDigest. Services implemented by other security providers should be disabled.
-
-`jdk.security.providers.filter=!SUN.MessageDigest; SUN`
-
-Notice how in this example the more specific pattern involving the SUN security provider is located left to the most general one. Otherwise, the general pattern will make a decision for all services implemented by SUN, including MessageDigest, and the specific pattern would be ignored.
-
 ### Examples of incorrectly defined filter values
 
 Enable all services except for the HmacMD5 algorithm, irrespective of the security provider and the service type:
 
 `jdk.security.providers.filter=*; !*.*.HmacMD5`
 
-This is incorrect because the rule `"*"` matches and allows any service, while the rule blocking HmacMD5 is always ignored. The correct filter value for this example would be: `!*.*.HmacMD5; *`
-
---
-
-Enable all services implemented by SUN except for MessageDigest. Services implemented by other security providers should be disabled.
-
-`jdk.security.providers.filter=!SUN.MessageDigest`
-
-While both SUN's MessageDigest services and services implemented by other security providers are disabled, SUN's non-MessageDigest services are not enabled. The correct filter value for this example would be `!SUN.MessageDigest; SUN`
+This is incorrect because the rule `"*"` matches and allows any service, while the rule blocking HmacMD5 is always ignored. The correct filter value for this example is `!*.*.HmacMD5; *`
 
 --
 
@@ -227,7 +101,7 @@ Enable all services implemented by the SunPKCS11 security provider. Services imp
 
 `jdk.security.providers.filter=SunPKCS11`
 
-This is incorrect because the SunPKCS11 provider has to be identified by its name and not its class. A valid name would have the form of _SunPKCS11-SomeName_. A correct filter value for this example would be `SunPKCS11-SomeName or SunPKCS11-*`
+This is incorrect because the SunPKCS11 provider has to be identified by its name and not its class. A valid name would have the form of _SunPKCS11-SomeName_. A correct filter value for this example is `SunPKCS11-SomeName or SunPKCS11-*`
 
 
 Alternatives
